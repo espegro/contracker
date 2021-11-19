@@ -1,0 +1,314 @@
+#!/usr/libexec/platform-python
+# @lint-avoid-python-3-compatibility-imports
+#
+# Based on tcpconnect
+#
+# tcpconnect    Trace TCP connect()s.
+#
+# Copyright (c) 2015 Brendan Gregg.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 25-Sep-2015   Brendan Gregg   Created this.
+# 14-Feb-2016      "      "     Switch to bpf_perf_output.
+# 09-Jan-2019   Takuma Kume     Support filtering by UID
+# 30-Jul-2019   Xiaozhou Liu    Count connects.
+#
+# Rewrite to contracker
+# Trace TCP connects, output in JSONL format.
+#
+# 17-Aug-2021	Espen Grøndahl  
+#
+
+from __future__ import print_function
+from bcc import BPF
+from socket import inet_ntop, ntohs, AF_INET, AF_INET6
+from struct import pack
+from time import sleep
+from datetime import datetime
+import pwd
+import argparse
+import sys
+import yaml
+
+def printb(s, file=sys.stdout, nl=1):
+    """
+    printb(s)
+    print a bytes object to stdout and flush
+    """
+    buf = file.buffer if hasattr(file, "buffer") else file
+
+    buf.write(s)
+    if nl:
+        buf.write(b"\n")
+    file.flush()
+
+# arguments                                                                                                           
+examples = """examples:                                                                                               
+    ./contracker           			# trace all TCP connect()s                                                                 
+    ./contracker -c config.yaml                 # Load addiontal settings from config file
+    ./contracker -l logfile.json
+"""                                                                                                                   
+parser = argparse.ArgumentParser(                                                                                     
+    description="Trace TCP connects",                                                                                 
+    formatter_class=argparse.RawDescriptionHelpFormatter,                                                             
+    epilog=examples)                                                                                                  
+parser.add_argument("-c", "--config",
+    help="config file")                                                                
+parser.add_argument("-l", "--log",
+    help="logfilename")                                                                
+args = parser.parse_args()                                                                                            
+debug = 0 
+
+portlist = []
+uidlist = []
+mutelist = []
+
+# Parse config
+with open(args.config, "r") as f:
+    config = yaml.load(f)
+    if config["port"]:
+       portlist = ",".join(config["port"])
+    if config["uid"]:
+       uidlist = ",".join(config["uid"])
+    if config["uid"]:
+       mutelist = ",".join(config["mute"])
+
+
+#############
+#
+# BPF code
+#
+#############
+
+# define BPF program
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <net/sock.h>
+#include <bcc/proto.h>
+
+BPF_HASH(currsock, u32, struct sock *);
+
+// separate data structs for ipv4 and ipv6
+struct ipv4_data_t {
+    u64 ts_us;
+    u32 pid;
+    u32 uid;
+    u32 saddr;
+    u32 daddr;
+    u64 ip;
+    u16 dport;
+    char task[TASK_COMM_LEN];
+};
+BPF_PERF_OUTPUT(ipv4_events);
+
+struct ipv6_data_t {
+    u64 ts_us;
+    u32 pid;
+    u32 uid;
+    unsigned __int128 saddr;
+    unsigned __int128 daddr;
+    u64 ip;
+    u16 dport;
+    char task[TASK_COMM_LEN];
+};
+BPF_PERF_OUTPUT(ipv6_events);
+
+// separate flow keys per address family
+struct ipv4_flow_key_t {
+    u32 saddr;
+    u32 daddr;
+    u16 dport;
+};
+BPF_HASH(ipv4_count, struct ipv4_flow_key_t);
+
+struct ipv6_flow_key_t {
+    unsigned __int128 saddr;
+    unsigned __int128 daddr;
+    u16 dport;
+};
+BPF_HASH(ipv6_count, struct ipv6_flow_key_t);
+
+int trace_connect_entry(struct pt_regs *ctx, struct sock *sk)
+{
+
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = pid_tgid;
+
+    u32 uid = bpf_get_current_uid_gid();
+    FILTER_UID
+
+    // stash the sock ptr for lookup on return
+    currsock.update(&tid, &sk);
+
+    return 0;
+};
+
+static int trace_connect_return(struct pt_regs *ctx, short ipver)
+{
+    int ret = PT_REGS_RC(ctx);
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = pid_tgid;
+
+    struct sock **skpp;
+    skpp = currsock.lookup(&tid);
+    if (skpp == 0) {
+        return 0;   // missed entry
+    }
+
+    if (ret != 0) {
+        // failed to send SYNC packet, may not have populated
+        // socket __sk_common.{skc_rcv_saddr, ...}
+        currsock.delete(&tid);
+        return 0;
+    }
+
+    // pull in details
+    struct sock *skp = *skpp;
+    u16 dport = skp->__sk_common.skc_dport;
+
+    FILTER_PORT    
+
+    if (ipver == 4) {
+        IPV4_CODE
+    } else /* 6 */ {
+        IPV6_CODE
+    }
+
+    currsock.delete(&tid);
+
+    return 0;
+}
+
+int trace_connect_v4_return(struct pt_regs *ctx)
+{
+    return trace_connect_return(ctx, 4);
+}
+
+int trace_connect_v6_return(struct pt_regs *ctx)
+{
+    return trace_connect_return(ctx, 6);
+}
+"""
+
+########################
+#
+# End of BPF program
+#
+########################
+
+struct_init = { 'ipv4':
+        { 'trace' :
+               """
+               struct ipv4_data_t data4 = {.pid = pid, .ip = ipver};
+               data4.uid = bpf_get_current_uid_gid();
+               data4.ts_us = bpf_ktime_get_ns() / 1000;
+               data4.saddr = skp->__sk_common.skc_rcv_saddr;
+               data4.daddr = skp->__sk_common.skc_daddr;
+               data4.dport = ntohs(dport);
+               bpf_get_current_comm(&data4.task, sizeof(data4.task));
+               ipv4_events.perf_submit(ctx, &data4, sizeof(data4));"""
+               },
+        'ipv6':
+        { 'trace' :
+               """
+               struct ipv6_data_t data6 = {.pid = pid, .ip = ipver};
+               data6.uid = bpf_get_current_uid_gid();
+               data6.ts_us = bpf_ktime_get_ns() / 1000;
+               bpf_probe_read_kernel(&data6.saddr, sizeof(data6.saddr),
+                   skp->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+               bpf_probe_read_kernel(&data6.daddr, sizeof(data6.daddr),
+                   skp->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+               data6.dport = ntohs(dport);
+               bpf_get_current_comm(&data6.task, sizeof(data6.task));
+               ipv6_events.perf_submit(ctx, &data6, sizeof(data6));"""
+               }
+        }
+
+# code substitutions
+bpf_text = bpf_text.replace("IPV4_CODE", struct_init['ipv4']['trace'])
+bpf_text = bpf_text.replace("IPV6_CODE", struct_init['ipv6']['trace'])
+
+
+# Filter UID - build ebpf text to filter uids
+if uidlist:
+    uids = [int(uid) for uid in uidlist.split(',')]
+    uid_if = ' || '.join(['uid == %s' % uid for uid in uids])
+    bpf_text = bpf_text.replace('FILTER_UID',
+        'if (%s) { return 0; }' % uid_if)
+
+# Filter ports - build ebpf text to filter ports
+if portlist:
+    dports = [int(dport) for dport in portlist.split(',')]
+    dports_if = ' || '.join(['dport == %d' % ntohs(dport) for dport in dports])
+    bpf_text = bpf_text.replace('FILTER_PORT',
+        'if (%s) { currsock.delete(&pid); return 0; }' % dports_if) 
+
+# Filter comms - build list of muted comms
+if mutelist:
+    mcomms = [str(mute) for mute in mutelist.split(',')]
+else:
+    mcomms = []
+
+# Remove unused placeholders in ebpf text
+bpf_text = bpf_text.replace('FILTER_PORT', '')
+bpf_text = bpf_text.replace('FILTER_UID', '')
+
+# process event
+def print_ipv4_event(cpu, data, size):
+    event = b["ipv4_events"].event(data)
+    # Print if comm isnt muted
+    if not event.task.decode() in mcomms :
+        # Get timestamp and username
+        eventtime = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f").encode()
+        user = pwd.getpwuid(event.uid).pw_name.encode()
+        if args.log:
+            f = open(args.log, 'a')
+            sys.stdout = f
+        else:
+            f = sys.stdout 		
+        # Build JOSN line
+        printb(b"{ \"timestamp\": \"%s\", \"user\": \"%s\", "  % (eventtime,user), f,nl = "")
+        printb(b"\"uid\": \"%d\", \"comm\": \"%s\", " % (event.uid, event.task), f,nl = "" )
+        printb(b"\"pid\": \"%d\", \"ipv\": \"%d\", " % (event.pid, event.ip), f,nl = "")
+        printb(b"\"srcip\": \"%s\", \"dstip\": \"%s\", \"dstport\": \"%d\" }" % (
+            inet_ntop(AF_INET, pack("I", event.saddr)).encode(),
+            inet_ntop(AF_INET, pack("I", event.daddr)).encode(), event.dport), f, nl = "1")
+
+def print_ipv6_event(cpu, data, size):
+    event = b["ipv6_events"].event(data)
+    # Print if comm isnt muted
+    if not event.task.decode() in mcomms :
+        # Get timestamp and username
+        eventtime = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f").encode()
+        user = pwd.getpwuid(event.uid).pw_name.encode()
+        if args.log:
+            f = open(args.log, 'a')
+            sys.stdout = f
+        else:
+            f = sys.stdout 		
+        # Build JOSN line
+        printb(b"{ \"timestamp\": \"%s\", \"user\": \"%s\", "  % (eventtime,user), f,nl = "")
+        printb(b"\"uid\": \"%d\", \"comm\": \"%s\", " % (event.uid, event.task), f,nl = "" )
+        printb(b"\"pid\": \"%d\", \"ipv\": \"%d\", " % (event.pid, event.ip), f,nl = "")
+        printb(b"\"srcip\": \"%s\", \"dstip\": \"%s\", \"dstport\": \"%d\" }" % (
+            inet_ntop(AF_INET6, event.saddr).encode(), inet_ntop(AF_INET6, event.daddr).encode(),
+            event.dport),f, nl = "1")
+
+
+# initialize BPF
+b = BPF(text=bpf_text)
+b.attach_kprobe(event="tcp_v4_connect", fn_name="trace_connect_entry")
+b.attach_kprobe(event="tcp_v6_connect", fn_name="trace_connect_entry")
+b.attach_kretprobe(event="tcp_v4_connect", fn_name="trace_connect_v4_return")
+b.attach_kretprobe(event="tcp_v6_connect", fn_name="trace_connect_v6_return")
+
+# read events
+b["ipv4_events"].open_perf_buffer(print_ipv4_event)
+b["ipv6_events"].open_perf_buffer(print_ipv6_event)
+while 1:
+  try:
+      b.perf_buffer_poll()
+  except KeyboardInterrupt:
+      exit()
