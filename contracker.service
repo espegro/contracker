@@ -1,0 +1,13 @@
+[Unit]
+Description=tcp connection tracker service
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+User=root
+ExecStart=/usr/local/sbin/contracker -c /etc/contracker.yaml -l /var/log/contracker.json
+
+[Install]
+WantedBy=multi-user.target
