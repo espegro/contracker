@@ -264,7 +264,7 @@ def print_ipv4_event(cpu, data, size):
         eventtime = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f").encode()
         user = pwd.getpwuid(event.uid).pw_name.encode()
         if args.log:
-            f = open(args.log, 'a')
+            f = open(args.log, 'a+')
             sys.stdout = f
         else:
             f = sys.stdout 		
@@ -284,7 +284,7 @@ def print_ipv6_event(cpu, data, size):
         eventtime = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f").encode()
         user = pwd.getpwuid(event.uid).pw_name.encode()
         if args.log:
-            f = open(args.log, 'a')
+            f = open(args.log, 'a+')
             sys.stdout = f
         else:
             f = sys.stdout 		
